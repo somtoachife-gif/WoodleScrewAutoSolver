@@ -19,6 +19,13 @@ object PuzzleDetector {
         val levelButtonY: Int? = null
     )
 
+    data class Plan(
+        val screw: Screw,
+        val targetIndex: Int,
+        val matchingVisible: Int,
+        val confidence: Float
+    )
+
     fun detect(source: Bitmap): Detection {
         val scale = min(1f, 720f / source.width.toFloat())
         val w = max(1, (source.width * scale).roundToInt())
@@ -27,7 +34,6 @@ object PuzzleDetector {
         val px = IntArray(w * h)
         bmp.getPixels(px, 0, w, 0, 0, w, h)
 
-        // Home screen LEVEL button from the supplied mobile gameplay.
         val level = detectGreenLevelButton(px, w, h)
         if (level != null) {
             val inv = source.width.toFloat() / w
@@ -41,15 +47,15 @@ object PuzzleDetector {
             )
         }
 
-        // The two live collector trays are fixed near the top-left in the mobile game.
-        // Sample their colored outer edge / screw area instead of trying to infer the
-        // whole box. This also supports gray targets, which have very low saturation.
+        // Read both active collector colors. V4 does NOT use those colors while
+        // detecting screw geometry; that was one reason V2/V3 could see nothing
+        // after the first move. First find screw-shaped objects, then plan by color.
         val targets = listOfNotNull(
             sampleTargetSlot(px, w, h, 0),
             sampleTargetSlot(px, w, h, 1)
         )
 
-        val screws = detectScrews(px, w, h, targets)
+        val screws = detectAllScrews(px, w, h)
         val inv = source.width.toFloat() / w
         val mapped = screws.map {
             it.copy(x = (it.x * inv).roundToInt(), y = (it.y * inv).roundToInt())
@@ -57,37 +63,86 @@ object PuzzleDetector {
 
         if (bmp !== source) bmp.recycle()
 
+        val puzzle = targets.isNotEmpty() && mapped.isNotEmpty()
         return Detection(
-            state = if (targets.isNotEmpty() && mapped.isNotEmpty()) ScreenState.PUZZLE else ScreenState.WAIT,
-            targets = targets,
-            screws = mapped
+            if (puzzle) ScreenState.PUZZLE else ScreenState.WAIT,
+            targets,
+            mapped
         )
     }
 
-    fun chooseTap(d: Detection): Screw? {
-        if (d.state != ScreenState.PUZZLE || d.targets.isEmpty()) return null
+    /**
+     * V4 planner:
+     * 1. Match every visible screw against each live target color.
+     * 2. Prefer a target color with >=3 visible matching screws, because Woodle's
+     *    basic objective is to collect matching sets of three.
+     * 3. Within that color, tap the screw with the strongest visual confidence.
+     * 4. After the tap the service captures the NEW board and plans again.
+     *
+     * This deliberately avoids trying to predict full rigid-body physics. Replanning
+     * after every move is much more robust when wooden pieces fall or rotate.
+     */
+    fun planMove(d: Detection): Plan? {
+        if (d.state != ScreenState.PUZZLE || d.targets.isEmpty() || d.screws.isEmpty()) return null
 
-        return d.screws.mapNotNull { s ->
-            val dist = d.targets.minOfOrNull { colorDistance(s.hsv, it) } ?: return@mapNotNull null
-            // V3 is intentionally more permissive than V2. The visual screw detector
-            // already requires a dark plus-shaped center surrounded by a round head.
-            if (dist < 58f) s to (s.score * 60f - dist) else null
-        }.maxByOrNull { it.second }?.first
+        var bestPlan: Plan? = null
+        var bestPlanScore = Float.NEGATIVE_INFINITY
+
+        d.targets.forEachIndexed { targetIndex, target ->
+            val compatible = d.screws.mapNotNull { screw ->
+                val dist = colorDistance(screw.hsv, target)
+                // Neutral/gray targets need a little extra tolerance.
+                val limit = if (target.s < .20f) 54f else 46f
+                if (dist <= limit) screw to dist else null
+            }
+
+            if (compatible.isEmpty()) return@forEachIndexed
+
+            val count = compatible.size
+            val setBonus = when {
+                count >= 3 -> 75f
+                count == 2 -> 28f
+                else -> 0f
+            }
+
+            // We prefer a confident screw and a close target-color match.
+            val chosen = compatible.maxByOrNull { (screw, dist) ->
+                screw.score * 70f - dist
+            } ?: return@forEachIndexed
+
+            val screw = chosen.first
+            val dist = chosen.second
+            val confidence = (100f - dist + screw.score * 45f).coerceIn(0f, 150f)
+            val total = setBonus + confidence
+
+            if (total > bestPlanScore) {
+                bestPlanScore = total
+                bestPlan = Plan(screw, targetIndex, count, confidence)
+            }
+        }
+
+        // If no active target color is confidently represented, do nothing rather
+        // than guessing. The next video frame may reveal a moved/exposed screw.
+        return bestPlan
     }
 
-    private fun detectScrews(px: IntArray, w: Int, h: Int, targets: List<Hsv>): List<Screw> {
-        if (targets.isEmpty()) return emptyList()
+    fun chooseTap(d: Detection): Screw? = planMove(d)?.screw
 
+    private fun detectAllScrews(px: IntArray, w: Int, h: Int): List<Screw> {
         val found = mutableListOf<Screw>()
+
+        // Safe puzzle-board region measured from the supplied portrait gameplay.
         val x1 = (w * .015f).toInt()
         val x2 = (w * .985f).toInt()
-        val y1 = (h * .28f).toInt()   // below collector trays / empty holes
-        val y2 = (h * .78f).toInt()   // above tools and banner ad
-        val step = max(5, w / 130)
+        val y1 = (h * .25f).toInt()
+        val y2 = (h * .80f).toInt()
+
+        val step = max(4, w / 155)
         val radii = intArrayOf(
-            max(14, (w * .026f).toInt()),
-            max(17, (w * .032f).toInt()),
-            max(20, (w * .038f).toInt())
+            max(11, (w * .021f).toInt()),
+            max(14, (w * .027f).toInt()),
+            max(17, (w * .033f).toInt()),
+            max(20, (w * .039f).toInt())
         )
 
         for (y in y1 until y2 step step) {
@@ -99,65 +154,93 @@ object PuzzleDetector {
 
                     val ring = sampleRing(px, w, h, x, y, r)
                     val center = sampleCenter(px, w, h, x, y, r)
-                    val targetDist = targets.minOf { colorDistance(ring, it) }
-                    if (targetDist > 66f) continue
 
-                    // Real Woodle screws have a noticeably darker plus at the center.
-                    // V2 mistakenly required the CENTER pixel itself to be saturated,
-                    // which rejected the actual dark plus. V3 removes that mistake.
+                    // Colored screw head surrounding a dark + / slot center.
                     val darkness = (ring.v - center.v).coerceAtLeast(0f)
-                    val score = darkness * 1.9f + ring.s * .35f + (1f - min(targetDist, 70f) / 70f) * .45f
-                    if (score < .32f) continue
+                    val colorful = ring.s
 
-                    if (best == null || score > best.score) best = Screw(x, y, ring, score)
+                    // Very dark wood holes are filtered by ring brightness; flat
+                    // colored artwork is filtered by the missing dark center.
+                    if (ring.v < .24f) continue
+                    if (darkness < .075f) continue
+                    if (colorful < .10f && ring.v < .42f) continue
+
+                    val symmetry = radialConsistency(px, w, h, x, y, r)
+                    val score = darkness * 2.4f + colorful * .38f + symmetry * .45f
+                    if (score < .31f) continue
+
+                    val candidate = Screw(x, y, ring, score)
+                    if (best == null || candidate.score > best.score) best = candidate
                 }
 
                 if (best != null) {
-                    val minSep = (w * .055f)
-                    val duplicate = found.any {
+                    val minSep = w * .045f
+                    val duplicateIndex = found.indexOfFirst {
                         val dx = it.x - best.x
                         val dy = it.y - best.y
                         dx*dx + dy*dy < minSep*minSep
                     }
-                    if (!duplicate) found += best
+                    if (duplicateIndex < 0) {
+                        found += best
+                    } else if (best.score > found[duplicateIndex].score) {
+                        found[duplicateIndex] = best
+                    }
                 }
             }
         }
 
-        return found.sortedByDescending { it.score }.take(40)
+        return found.sortedByDescending { it.score }.take(70)
+    }
+
+    private fun radialConsistency(px: IntArray, w: Int, h: Int, cx: Int, cy: Int, r: Int): Float {
+        val vals = mutableListOf<Float>()
+        val rr = (r * .62f).toInt()
+        val dirs = arrayOf(
+            1 to 0, -1 to 0, 0 to 1, 0 to -1,
+            1 to 1, -1 to 1, 1 to -1, -1 to -1
+        )
+        for ((dx,dy) in dirs) {
+            val len = if (dx != 0 && dy != 0) (rr * .71f).toInt() else rr
+            val x = cx + dx*len
+            val y = cy + dy*len
+            if (x in 0 until w && y in 0 until h) vals += rgbToHsv(px[y*w+x]).v
+        }
+        if (vals.size < 4) return 0f
+        val avg = vals.average().toFloat()
+        val dev = vals.map { abs(it-avg) }.average().toFloat()
+        return (1f - dev * 2.5f).coerceIn(0f, 1f)
     }
 
     private fun sampleTargetSlot(px: IntArray, w: Int, h: Int, slot: Int): Hsv? {
-        // Calibrated from the supplied 720x1568 portrait gameplay.
-        // Slot 0 spans about x=20..180, slot 1 about x=195..355, y=175..340.
-        val sx = if (slot == 0) .14f else .38f
-        val sy = .15f
-        val cx = (w * sx).roundToInt()
-        val cy = (h * sy).roundToInt()
-        val r = max(16, (w * .037f).toInt())
+        // The target boxes sit at the top-left. Instead of trusting one pixel,
+        // sample several points around the visible screw/token inside each tray and
+        // return the most chromatic representative color.
+        val baseX = if (slot == 0) .135f else .375f
+        val baseY = .145f
+        val cx = (w * baseX).roundToInt()
+        val cy = (h * baseY).roundToInt()
+        val r = max(13, (w * .032f).toInt())
 
-        // Sample the ring around the top screw icon in the collector tray.
-        // If that point is empty, also try the lower-left icon position.
-        val a = sampleRing(px, w, h, cx, cy, r)
-        if (a.v > .20f) return a
+        val samples = listOf(
+            sampleRing(px,w,h,cx,cy,r),
+            sampleRing(px,w,h,cx-(w*.045f).toInt(),cy+(h*.030f).toInt(),r),
+            sampleRing(px,w,h,cx+(w*.045f).toInt(),cy+(h*.030f).toInt(),r)
+        ).filter { it.v > .18f }
 
-        val cx2 = cx - (w * .045f).roundToInt()
-        val cy2 = cy + (h * .032f).roundToInt()
-        val b = sampleRing(px, w, h, cx2, cy2, r)
-        return if (b.v > .20f) b else null
+        if (samples.isEmpty()) return null
+
+        // Prefer saturated samples; gray is still allowed if no saturated color exists.
+        val colorful = samples.maxByOrNull { it.s + it.v*.12f } ?: return null
+        return colorful
     }
 
     private fun detectGreenLevelButton(px: IntArray, w: Int, h: Int): Pair<Int, Int>? {
-        // In the actual recording the green LEVEL 15 button is on the lower-left,
-        // not in the lower-middle. Yummy Town sits immediately to its right.
         val x1 = (w * .01f).toInt()
         val x2 = (w * .35f).toInt()
         val y1 = (h * .64f).toInt()
         val y2 = (h * .80f).toInt()
 
-        var sx = 0L
-        var sy = 0L
-        var n = 0
+        var sx = 0L; var sy = 0L; var n = 0
         for (y in y1 until y2 step 2) {
             for (x in x1 until x2 step 2) {
                 val c = rgbToHsv(px[y*w+x])
@@ -166,12 +249,9 @@ object PuzzleDetector {
                 }
             }
         }
-
-        // Require a LARGE green blob; isolated green screws/tools cannot qualify.
         val minPixels = max(180, (w*h*.0030f).toInt())
         if (n < minPixels) return null
-        val cx = (sx/n).toInt()
-        val cy = (sy/n).toInt()
+        val cx = (sx/n).toInt(); val cy = (sy/n).toInt()
         if (cx !in x1 until x2 || cy !in y1 until y2) return null
         return cx to cy
     }
@@ -191,11 +271,13 @@ object PuzzleDetector {
         for ((x,y) in pts) if (x in 0 until w && y in 0 until h) vals += rgbToHsv(px[y*w+x])
         if (vals.isEmpty()) return Hsv(0f,0f,0f)
 
-        // Use the most saturated/representative ring pixels instead of a plain hue
-        // average, which breaks around the 0/360 red boundary.
         val sorted = vals.sortedByDescending { it.s + it.v*.15f }
         val take = sorted.take(max(3, sorted.size/2))
-        return Hsv(circularHueAverage(take), take.map{it.s}.average().toFloat(), take.map{it.v}.average().toFloat())
+        return Hsv(
+            circularHueAverage(take),
+            take.map{it.s}.average().toFloat(),
+            take.map{it.v}.average().toFloat()
+        )
     }
 
     private fun sampleCenter(px: IntArray, w: Int, h: Int, cx: Int, cy: Int, r: Int): Hsv {
@@ -221,13 +303,9 @@ object PuzzleDetector {
     }
 
     private fun colorDistance(a: Hsv, b: Hsv): Float {
-        // Hue matters less for gray/neutral colors.
         val satMin=min(a.s,b.s)
-        val hueWeight=if(satMin<.18f) .12f else 1f
-        val hd=hueDiff(a.h,b.h)*hueWeight
-        val sd=abs(a.s-b.s)*55f
-        val vd=abs(a.v-b.v)*18f
-        return hd+sd+vd
+        val hueWeight=if(satMin<.18f) .10f else 1f
+        return hueDiff(a.h,b.h)*hueWeight + abs(a.s-b.s)*52f + abs(a.v-b.v)*14f
     }
 
     private fun hueDiff(a: Float,b: Float):Float {
