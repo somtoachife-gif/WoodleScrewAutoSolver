@@ -32,8 +32,7 @@ class ProjectionService : Service() {
     private val handlerThread = HandlerThread("WoodleSolverCapture")
     private lateinit var handler: Handler
 
-    @Volatile
-    private var running = false
+    @Volatile private var running = false
 
     private var lastTapX = -9999
     private var lastTapY = -9999
@@ -61,7 +60,7 @@ class ProjectionService : Service() {
                     intent.getParcelableExtra(EXTRA_RESULT_DATA)
                 }
                 if (code == Activity.RESULT_OK && data != null) {
-                    startForeground(NOTIFICATION_ID, buildNotification("V3 Speed: waiting for Woodle Screw"))
+                    startForeground(NOTIFICATION_ID, buildNotification("V4 Planner: waiting for Woodle Screw"))
                     startCapture(code, data)
                 } else stopSelf()
             }
@@ -100,6 +99,7 @@ class ProjectionService : Service() {
                 val pixelStride = plane.pixelStride
                 val rowStride = plane.rowStride
                 val rowPadding = rowStride - pixelStride * image.width
+
                 val padded = Bitmap.createBitmap(
                     image.width + rowPadding / pixelStride,
                     image.height,
@@ -108,6 +108,7 @@ class ProjectionService : Service() {
                 padded.copyPixelsFromBuffer(buffer)
                 val frame = Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
                 padded.recycle()
+
                 analyze(frame)
                 frame.recycle()
             } finally { image.close() }
@@ -117,9 +118,11 @@ class ProjectionService : Service() {
     private fun analyze(frame: Bitmap) {
         val now = SystemClock.elapsedRealtime()
 
+        // Never tap outside Woodle Screw. If an interstitial ad opens another app,
+        // the solver freezes until Woodle is foreground again.
         if (!AutoTapAccessibilityService.isWoodleForeground()) {
             levelStable = 0
-            updateNotification("Paused: Woodle Screw not foreground")
+            updateNotification("V4 paused: Woodle Screw not foreground")
             return
         }
 
@@ -128,7 +131,7 @@ class ProjectionService : Service() {
         when (detection.state) {
             PuzzleDetector.ScreenState.WAIT -> {
                 levelStable = 0
-                updateNotification("V3 Speed: waiting/loading/ad/reward")
+                updateNotification("V4: waiting for board / reward / ad")
             }
 
             PuzzleDetector.ScreenState.LEVEL_BUTTON -> {
@@ -141,80 +144,100 @@ class ProjectionService : Service() {
                     lastLevelY = y
                 }
 
-                updateNotification("V3 Speed: LEVEL found")
+                updateNotification("V4: LEVEL button ready")
                 if (levelStable < 2) return
-                if (now - lastTapAt < 650) return
+                if (now - lastTapAt < 500) return
 
                 if (AutoTapAccessibilityService.tap(x.toFloat(), y.toFloat())) {
-                    lastTapX=x; lastTapY=y; lastTapAt=now; levelStable=0
-                    updateNotification("V3 Speed: starting level")
+                    lastTapX = x
+                    lastTapY = y
+                    lastTapAt = now
+                    levelStable = 0
+                    updateNotification("V4: starting next level")
                 }
             }
 
             PuzzleDetector.ScreenState.PUZZLE -> {
                 levelStable = 0
 
-                // Fast mode: enough time for a screw to animate away, but much
-                // shorter than V2's 700 ms + 2-frame confirmation.
-                if (now - lastTapAt < 300) return
+                // Re-read and re-plan quickly after each move. 220 ms is long enough
+                // for the screw-removal animation to start but much faster than V2.
+                if (now - lastTapAt < 220) return
 
-                val candidate = PuzzleDetector.chooseTap(detection)
-                updateNotification("V3: targets=${detection.targets.size} screws=${detection.screws.size}")
-                if (candidate == null) return
+                val plan = PuzzleDetector.planMove(detection)
+                if (plan == null) {
+                    updateNotification(
+                        "V4 planning: targets=${detection.targets.size}, screws=${detection.screws.size}, waiting"
+                    )
+                    return
+                }
 
-                // Never tap UI trays, tools, or banner ads.
-                val minY=(frame.height*.28f).toInt()
-                val maxY=(frame.height*.78f).toInt()
-                val minX=(frame.width*.01f).toInt()
-                val maxX=(frame.width*.99f).toInt()
-                if(candidate.x !in minX..maxX || candidate.y !in minY..maxY) return
+                val candidate = plan.screw
 
-                // Prevent rapid double-taps on a screw that is still animating.
-                val sameAsLast = kotlin.math.abs(candidate.x-lastTapX)<24 && kotlin.math.abs(candidate.y-lastTapY)<24
-                if(sameAsLast && now-lastTapAt<900) return
+                // Hard board-only zone: never tap collectors, tools, navigation or ads.
+                val minY = (frame.height * .25f).toInt()
+                val maxY = (frame.height * .80f).toInt()
+                val minX = (frame.width * .01f).toInt()
+                val maxX = (frame.width * .99f).toInt()
+                if (candidate.x !in minX..maxX || candidate.y !in minY..maxY) {
+                    updateNotification("V4 rejected unsafe tap")
+                    return
+                }
 
-                if(AutoTapAccessibilityService.tap(candidate.x.toFloat(),candidate.y.toFloat())) {
-                    lastTapX=candidate.x; lastTapY=candidate.y; lastTapAt=now
-                    updateNotification("V3 Speed: tapped screw")
+                // Do not hammer a coordinate while the old screw is disappearing.
+                val sameAsLast =
+                    kotlin.math.abs(candidate.x-lastTapX) < 22 &&
+                    kotlin.math.abs(candidate.y-lastTapY) < 22
+                if (sameAsLast && now-lastTapAt < 700) return
+
+                updateNotification(
+                    "V4 plan: target ${plan.targetIndex+1}, visible matches=${plan.matchingVisible}"
+                )
+
+                if (AutoTapAccessibilityService.tap(candidate.x.toFloat(), candidate.y.toFloat())) {
+                    lastTapX = candidate.x
+                    lastTapY = candidate.y
+                    lastTapAt = now
+                    updateNotification("V4: move made — replanning")
                 }
             }
         }
     }
 
     private fun stopSolver() {
-        running=false
-        reader?.setOnImageAvailableListener(null,null)
-        display?.release(); display=null
-        reader?.close(); reader=null
-        projection?.stop(); projection=null
+        running = false
+        reader?.setOnImageAvailableListener(null, null)
+        display?.release(); display = null
+        reader?.close(); reader = null
+        projection?.stop(); projection = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     private fun createNotificationChannel() {
-        if(Build.VERSION.SDK_INT>=26){
+        if (Build.VERSION.SDK_INT >= 26) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel(CHANNEL_ID,"Woodle Solver",NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(CHANNEL_ID, "Woodle Solver", NotificationManager.IMPORTANCE_LOW)
             )
         }
     }
 
-    private fun buildNotification(text:String):Notification =
-        NotificationCompat.Builder(this,CHANNEL_ID)
+    private fun buildNotification(text: String): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_view)
-            .setContentTitle("Woodle Solver V3 Speed")
+            .setContentTitle("Woodle Solver V4 Planner")
             .setContentText(text)
             .setOngoing(true)
             .build()
 
-    private fun updateNotification(text:String){
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,buildNotification(text))
+    private fun updateNotification(text: String) {
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(text))
     }
 
-    override fun onBind(intent:Intent?)=null
+    override fun onBind(intent: Intent?) = null
 
-    override fun onDestroy(){
-        running=false
+    override fun onDestroy() {
+        running = false
         handlerThread.quitSafely()
         super.onDestroy()
     }
