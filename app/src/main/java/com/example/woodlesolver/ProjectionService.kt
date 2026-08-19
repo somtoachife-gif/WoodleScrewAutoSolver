@@ -38,9 +38,14 @@ class ProjectionService : Service() {
     private var lastTapX = -9999
     private var lastTapY = -9999
     private var lastTapAt = 0L
+
     private var stableFrames = 0
     private var lastCandidateX = -1
     private var lastCandidateY = -1
+
+    private var levelButtonStableFrames = 0
+    private var lastLevelButtonX = -1
+    private var lastLevelButtonY = -1
 
     override fun onCreate() {
         super.onCreate()
@@ -62,7 +67,7 @@ class ProjectionService : Service() {
                 }
 
                 if (code == Activity.RESULT_OK && data != null) {
-                    startForeground(NOTIFICATION_ID, buildNotification("Reading Woodle Screw…"))
+                    startForeground(NOTIFICATION_ID, buildNotification("Waiting for Woodle Screw…"))
                     startCapture(code, data)
                 } else {
                     stopSelf()
@@ -134,46 +139,122 @@ class ProjectionService : Service() {
 
     private fun analyze(frame: Bitmap) {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastTapAt < 650) return
 
-        val detection = PuzzleDetector.detect(frame)
-        val candidate = PuzzleDetector.chooseTap(detection)
-
-        updateNotification("targets=${detection.targets.size}, screws=${detection.screws.size}")
-
-        if (candidate == null) {
-            stableFrames = 0
+        // Absolute safety gate: if an ad/browser/other game becomes foreground,
+        // do nothing until Woodle Screw is foreground again.
+        if (!AutoTapAccessibilityService.isWoodleForeground()) {
+            resetStableState()
+            updateNotification("Paused — Woodle Screw is not foreground")
             return
         }
 
-        val closeToLastCandidate =
-            kotlin.math.abs(candidate.x - lastCandidateX) < 22 &&
-            kotlin.math.abs(candidate.y - lastCandidateY) < 22
+        val detection = PuzzleDetector.detect(frame)
 
-        if (closeToLastCandidate) {
-            stableFrames++
-        } else {
-            stableFrames = 1
-            lastCandidateX = candidate.x
-            lastCandidateY = candidate.y
+        when (detection.state) {
+            PuzzleDetector.ScreenState.WAIT -> {
+                // This includes loading, PERFECT/reward animation, and ads.
+                // We intentionally DO NOT tap any Claim/Install/Yummy Town/ad UI.
+                resetStableState()
+                updateNotification("Waiting for level/reward/ad to finish")
+            }
+
+            PuzzleDetector.ScreenState.LEVEL_BUTTON -> {
+                stableFrames = 0
+                val x = detection.levelButtonX ?: return
+                val y = detection.levelButtonY ?: return
+
+                val sameButton =
+                    kotlin.math.abs(x - lastLevelButtonX) < 30 &&
+                    kotlin.math.abs(y - lastLevelButtonY) < 30
+
+                if (sameButton) {
+                    levelButtonStableFrames++
+                } else {
+                    levelButtonStableFrames = 1
+                    lastLevelButtonX = x
+                    lastLevelButtonY = y
+                }
+
+                updateNotification("Level button found (${levelButtonStableFrames}/3)")
+
+                // Require several consecutive frames so a green ad graphic cannot
+                // trigger a one-frame false positive.
+                if (levelButtonStableFrames < 3) return
+                if (now - lastTapAt < 1800) return
+
+                if (AutoTapAccessibilityService.tap(x.toFloat(), y.toFloat())) {
+                    lastTapX = x
+                    lastTapY = y
+                    lastTapAt = now
+                    levelButtonStableFrames = 0
+                    updateNotification("Starting next level")
+                }
+            }
+
+            PuzzleDetector.ScreenState.PUZZLE -> {
+                levelButtonStableFrames = 0
+
+                // Let the board settle after each tap / level transition.
+                if (now - lastTapAt < 700) return
+
+                val candidate = PuzzleDetector.chooseTap(detection)
+                updateNotification(
+                    "Puzzle: targets=${detection.targets.size}, screws=${detection.screws.size}"
+                )
+
+                if (candidate == null) {
+                    stableFrames = 0
+                    return
+                }
+
+                // Extra hard safety zone copied from the actual gameplay layout:
+                // never touch collector boxes, tools, bottom banners, or navigation.
+                val minY = (frame.height * .22f).toInt()
+                val maxY = (frame.height * .82f).toInt()
+                val minX = (frame.width * .02f).toInt()
+                val maxX = (frame.width * .98f).toInt()
+                if (candidate.x !in minX..maxX || candidate.y !in minY..maxY) {
+                    stableFrames = 0
+                    return
+                }
+
+                val closeToLastCandidate =
+                    kotlin.math.abs(candidate.x - lastCandidateX) < 22 &&
+                    kotlin.math.abs(candidate.y - lastCandidateY) < 22
+
+                if (closeToLastCandidate) {
+                    stableFrames++
+                } else {
+                    stableFrames = 1
+                    lastCandidateX = candidate.x
+                    lastCandidateY = candidate.y
+                }
+
+                if (stableFrames < 2) return
+
+                val sameAsLastTap =
+                    kotlin.math.abs(candidate.x - lastTapX) < 24 &&
+                    kotlin.math.abs(candidate.y - lastTapY) < 24
+                if (sameAsLastTap && now - lastTapAt < 2400) return
+
+                if (AutoTapAccessibilityService.tap(candidate.x.toFloat(), candidate.y.toFloat())) {
+                    lastTapX = candidate.x
+                    lastTapY = candidate.y
+                    lastTapAt = now
+                    stableFrames = 0
+                    updateNotification("Tapped screw (${candidate.x}, ${candidate.y})")
+                }
+            }
         }
+    }
 
-        if (stableFrames < 2) return
-
-        val sameAsLastTap =
-            kotlin.math.abs(candidate.x - lastTapX) < 24 &&
-            kotlin.math.abs(candidate.y - lastTapY) < 24
-        if (sameAsLastTap && now - lastTapAt < 2400) return
-
-        val tapped = AutoTapAccessibilityService.tap(candidate.x.toFloat(), candidate.y.toFloat())
-
-        if (tapped) {
-            lastTapX = candidate.x
-            lastTapY = candidate.y
-            lastTapAt = now
-            stableFrames = 0
-            updateNotification("Tapped (${candidate.x}, ${candidate.y})")
-        }
+    private fun resetStableState() {
+        stableFrames = 0
+        levelButtonStableFrames = 0
+        lastCandidateX = -1
+        lastCandidateY = -1
+        lastLevelButtonX = -1
+        lastLevelButtonY = -1
     }
 
     private fun stopSolver() {
