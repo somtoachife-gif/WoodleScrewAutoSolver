@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Woodle Solver</string>
+    <string name="accessibility_description">Allows the solver to perform taps you authorize while the solver is running.</string>
+</resources>
