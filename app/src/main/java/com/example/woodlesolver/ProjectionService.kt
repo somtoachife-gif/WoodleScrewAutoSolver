@@ -67,7 +67,7 @@ class ProjectionService : Service() {
                 val data = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
                 else { @Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_RESULT_DATA) }
                 if (code == Activity.RESULT_OK && data != null) {
-                    startForeground(NOTIFICATION_ID, buildNotification("V6: waiting for Woodle Screw"))
+                    startForeground(NOTIFICATION_ID, buildNotification("V7: waiting for Woodle Screw"))
                     startCapture(code, data)
                 } else stopSelf()
             }
@@ -120,7 +120,7 @@ class ProjectionService : Service() {
             resetStability()
             awaitingTapResult = false
             preTapSignature = null
-            updateNotification("V6 paused: Woodle Screw not foreground")
+            updateNotification("V7 paused: Woodle Screw not foreground")
             return
         }
 
@@ -132,7 +132,7 @@ class ProjectionService : Service() {
                 resetStability()
                 awaitingTapResult = false
                 preTapSignature = null
-                updateNotification("V6: waiting for board / reward / ad")
+                updateNotification("V7: waiting for board / reward / ad")
             }
 
             PuzzleDetector.ScreenState.LEVEL_BUTTON -> {
@@ -143,11 +143,11 @@ class ProjectionService : Service() {
                 val y = detection.levelButtonY ?: return
                 val same = abs(x-lastLevelX) < 28 && abs(y-lastLevelY) < 28
                 if (same) levelStable++ else { levelStable=1; lastLevelX=x; lastLevelY=y }
-                updateNotification("V6: LEVEL button ready")
+                updateNotification("V7: LEVEL button ready")
                 if (levelStable < 2 || now-lastTapAt < 320L) return
                 if (AutoTapAccessibilityService.tap(x.toFloat(),y.toFloat())) {
                     lastTapX=x; lastTapY=y; lastTapAt=now; levelStable=0
-                    updateNotification("V6: starting next level")
+                    updateNotification("V7: starting next level")
                 }
             }
 
@@ -156,33 +156,35 @@ class ProjectionService : Service() {
 
                 if (awaitingTapResult) {
                     when (verifyTapOutcome(frame, now)) {
-                        0 -> { updateNotification("V6: verifying move…"); return }
+                        0 -> { updateNotification("V7: verifying move…"); return }
                         1 -> { awaitingTapResult=false; preTapSignature=null; resetStability() }
                         -1 -> {
                             awaitingTapResult=false
                             preTapSignature=null
                             failedTapX=lastTapX; failedTapY=lastTapY; failedTapAt=now
                             resetStability()
-                            updateNotification("V6 recovery: move had no effect — replanning")
+                            updateNotification("V7 recovery: move had no effect — rebuilding board")
                             return
                         }
                     }
                 }
 
                 if (!boardReadyForNextMove(frame, now)) {
-                    updateNotification("V6: board moving — watching")
+                    updateNotification("V7: board moving — watching")
                     return
                 }
 
-                val plan = BoardPlanner.plan(detection)
+                // V7 builds a fresh piece/layer model on every settled board.
+                val structure = PieceAnalyzer.analyze(frame, detection)
+                val plan = BoardPlanner.plan(detection, structure)
                 if (plan == null) {
-                    updateNotification("V6: no confident candidates — rescanning")
+                    updateNotification("V7: no confident structural move — rescanning")
                     return
                 }
 
                 if (!plan.safeToTap) {
                     val pct = (plan.confidence*100f).toInt()
-                    updateNotification("V6 unsure ($pct%, margin ${plan.margin.toInt()}) — waiting")
+                    updateNotification("V7 unsure ($pct%, margin ${plan.margin.toInt()}) — waiting")
                     return
                 }
 
@@ -190,7 +192,7 @@ class ProjectionService : Service() {
                 val minY=(frame.height*.25f).toInt(); val maxY=(frame.height*.80f).toInt()
                 val minX=(frame.width*.01f).toInt(); val maxX=(frame.width*.99f).toInt()
                 if (candidate.x !in minX..maxX || candidate.y !in minY..maxY) {
-                    updateNotification("V6 rejected unsafe move")
+                    updateNotification("V7 rejected unsafe move")
                     return
                 }
 
@@ -199,19 +201,21 @@ class ProjectionService : Service() {
 
                 val sameAsFailed = abs(candidate.x-failedTapX)<28 && abs(candidate.y-failedTapY)<28
                 if (sameAsFailed && now-failedTapAt<1800L) {
-                    updateNotification("V6 recovery: avoiding failed coordinate")
+                    updateNotification("V7 recovery: avoiding failed coordinate")
                     return
                 }
 
                 val pct=(plan.confidence*100f).toInt()
-                updateNotification("V6 AI: $pct% confident, depth ${plan.depth}, matches=${plan.visibleMatches}")
+                val rel=(plan.releasePotential*100f).toInt()
+                val rev=(plan.revealPotential*100f).toInt()
+                updateNotification("V7 AI: $pct% | piece ${plan.pieceId+1}/${structure.pieceCount} | free $rel% reveal $rev%")
 
                 preTapSignature = boardSignature(frame)
                 if (AutoTapAccessibilityService.tap(candidate.x.toFloat(),candidate.y.toFloat())) {
                     lastTapX=candidate.x; lastTapY=candidate.y; lastTapAt=now
                     awaitingTapResult=true
                     resetStability()
-                    updateNotification("V6: move made — checking result")
+                    updateNotification("V7: structural move made — rescanning layers")
                 } else {
                     preTapSignature=null
                 }
@@ -219,7 +223,6 @@ class ProjectionService : Service() {
         }
     }
 
-    // 0 = still waiting, 1 = board changed, -1 = tap appears to have failed.
     private fun verifyTapOutcome(frame: Bitmap, now: Long): Int {
         val elapsed = now-lastTapAt
         if (elapsed < VERIFY_START_MS) return 0
@@ -290,7 +293,7 @@ class ProjectionService : Service() {
 
     private fun buildNotification(text:String):Notification = NotificationCompat.Builder(this,CHANNEL_ID)
         .setSmallIcon(android.R.drawable.ic_menu_view)
-        .setContentTitle("Woodle Solver V6 AI")
+        .setContentTitle("Woodle Solver V7 Piece AI")
         .setContentText(text)
         .setOngoing(true)
         .build()
