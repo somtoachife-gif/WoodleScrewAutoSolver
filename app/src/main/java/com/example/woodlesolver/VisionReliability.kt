@@ -5,34 +5,45 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
-/** V11 perception pass: canonical colors + stricter local screw-shape validation. */
+/** V13 perception pass: canonical colors + stricter local screw-shape validation. */
 object VisionReliability {
     enum class ColorClass { RED, ORANGE, YELLOW, GREEN, CYAN, BLUE, PURPLE, PINK, BROWN, GRAY, UNKNOWN }
 
     data class Result(
         val detection: PuzzleDetector.Detection,
         val rejected: Int,
+        val rejectedScrews: List<PuzzleDetector.Screw>,
         val avgConfidence: Float,
         val targetClasses: List<ColorClass>
     )
 
     fun refine(frame: Bitmap, raw: PuzzleDetector.Detection, careful: Boolean): Result {
-        if (raw.state != PuzzleDetector.ScreenState.PUZZLE) return Result(raw,0,1f,emptyList())
+        if (raw.state != PuzzleDetector.ScreenState.PUZZLE) return Result(raw,0,emptyList(),1f,emptyList())
         val minScore = if (careful) .48f else .38f
-        val filtered = raw.screws.mapNotNull { s ->
+        val kept = mutableListOf<PuzzleDetector.Screw>()
+        val rejected = mutableListOf<PuzzleDetector.Screw>()
+
+        for (s in raw.screws) {
             val shape = screwShapeConfidence(frame,s.x,s.y)
             val cc = canonical(s.hsv)
-            if (shape < (if(careful).60f else .48f) || s.score < minScore || cc == ColorClass.UNKNOWN) null
-            else s.copy(score = (s.score*.62f + shape*.62f).coerceAtMost(1.6f))
+            if (shape < (if(careful).60f else .48f) || s.score < minScore || cc == ColorClass.UNKNOWN) {
+                rejected += s
+            } else {
+                kept += s.copy(score = (s.score*.62f + shape*.62f).coerceAtMost(1.6f))
+            }
         }
+
         val targets = raw.targets.map { canonical(it) }
-        // Reject screws whose canonical color is unrelated to every active target,
-        // but keep neutrals if target reading itself is uncertain.
         val active = targets.filter { it != ColorClass.UNKNOWN }.toSet()
-        val matched = if(active.isEmpty()) filtered else filtered.filter { s -> canonical(s.hsv) in active || canonical(s.hsv)==ColorClass.GRAY }
+        val matched = mutableListOf<PuzzleDetector.Screw>()
+        for (s in kept) {
+            val cc = canonical(s.hsv)
+            if(active.isEmpty() || cc in active || cc == ColorClass.GRAY) matched += s else rejected += s
+        }
+
         val avg = if(matched.isEmpty())0f else matched.map{(it.score/1.6f).coerceIn(0f,1f)}.average().toFloat()
         val d = raw.copy(screws = matched)
-        return Result(d, raw.screws.size-matched.size, avg, targets)
+        return Result(d, rejected.size, rejected, avg, targets)
     }
 
     fun canonical(h: PuzzleDetector.Hsv): ColorClass {
@@ -80,8 +91,6 @@ object VisionReliability {
     }
 }
 
-/** V11 lightweight collector memory. It is deliberately conservative: it only
- * remembers successful tap color classes and resets on a new LEVEL screen. */
 object CollectorTracker {
     private val partial = mutableMapOf<VisionReliability.ColorClass,Int>()
     fun reset(){ partial.clear() }
