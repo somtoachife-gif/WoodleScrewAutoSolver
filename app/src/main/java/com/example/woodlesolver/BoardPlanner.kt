@@ -4,7 +4,7 @@ import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.min
 
-/** V6 full-board planner with uncertainty awareness. */
+/** V7 full-board planner with uncertainty + piece/layer awareness. */
 object BoardPlanner {
     data class Result(
         val screw: PuzzleDetector.Screw,
@@ -14,10 +14,14 @@ object BoardPlanner {
         val runnerUpScore: Float,
         val confidence: Float,
         val margin: Float,
-        val depth: Int
+        val depth: Int,
+        val pieceId: Int,
+        val pieceScrewCount: Int,
+        val releasePotential: Float,
+        val revealPotential: Float
     ) {
         val safeToTap: Boolean
-            get() = confidence >= 0.62f && margin >= 13f && searchScore >= 95f
+            get() = confidence >= 0.64f && margin >= 12f && searchScore >= 100f
     }
 
     private data class Candidate(
@@ -25,41 +29,44 @@ object BoardPlanner {
         val targetIndex: Int,
         val colorCost: Float,
         val localDensity: Int,
-        val edgeFreedom: Float
+        val edgeFreedom: Float,
+        val structure: PieceAnalyzer.ScrewStructure
     )
 
     private data class Scored(val candidate: Candidate, val score: Float)
 
-    fun plan(d: PuzzleDetector.Detection): Result? {
+    fun plan(d: PuzzleDetector.Detection, structure: PieceAnalyzer.Analysis): Result? {
         if (d.state != PuzzleDetector.ScreenState.PUZZLE) return null
         if (d.targets.isEmpty() || d.screws.isEmpty()) return null
 
-        val candidates = buildCandidates(d)
+        val candidates = buildCandidates(d, structure)
         if (candidates.isEmpty()) return null
 
         val counts = IntArray(d.targets.size)
         for (c in candidates) counts[c.targetIndex]++
 
-        val beam = candidates.sortedByDescending { immediateScore(it, counts) }.take(12)
+        // V7 keeps the 3-ply beam search, but now each branch knows whether the
+        // move is likely to free a whole piece or reveal hidden board beneath it.
+        val beam = candidates.sortedByDescending { immediateScore(it, counts) }.take(14)
         val scored = mutableListOf<Scored>()
 
         for (first in beam) {
             val remaining1 = candidates.filter { it.screw !== first.screw }
             var futureBest = 0f
 
-            val secondBeam = remaining1.sortedByDescending { immediateScore(it, counts) }.take(8)
+            val secondBeam = remaining1.sortedByDescending { immediateScore(it, counts) }.take(9)
             for (second in secondBeam) {
                 val remaining2 = remaining1.filter { it.screw !== second.screw }
                 var thirdBest = 0f
-                for (third in remaining2.sortedByDescending { immediateScore(it, counts) }.take(10)) {
+                for (third in remaining2.sortedByDescending { immediateScore(it, counts) }.take(11)) {
                     val s3 = immediateScore(third, counts) + sequenceScore(first, second, third)
                     if (s3 > thirdBest) thirdBest = s3
                 }
-                val s2 = immediateScore(second, counts) + thirdBest * 0.38f
+                val s2 = immediateScore(second, counts) + thirdBest * .40f
                 if (s2 > futureBest) futureBest = s2
             }
 
-            scored += Scored(first, immediateScore(first, counts) + futureBest * 0.55f)
+            scored += Scored(first, immediateScore(first, counts) + futureBest * .57f)
         }
 
         val ranked = scored.sortedByDescending { it.score }
@@ -69,19 +76,26 @@ object BoardPlanner {
 
         val visualConfidence = (best.candidate.screw.score / 1.35f).coerceIn(0f, 1f)
         val colorConfidence = (1f - best.candidate.colorCost / 58f).coerceIn(0f, 1f)
-        val optionConfidence = (margin / 30f).coerceIn(0f, 1f)
+        val optionConfidence = (margin / 28f).coerceIn(0f, 1f)
+        val structureConfidence = (
+            best.candidate.structure.exposure*.35f +
+            best.candidate.structure.releasePotential*.35f +
+            best.candidate.structure.revealPotential*.30f
+        ).coerceIn(0f,1f)
         val setConfidence = when {
             counts[best.candidate.targetIndex] >= 3 -> 1f
             counts[best.candidate.targetIndex] == 2 -> .72f
             else -> .42f
         }
         val confidence = (
-            visualConfidence * .34f +
-            colorConfidence * .28f +
-            optionConfidence * .23f +
-            setConfidence * .15f
-        ).coerceIn(0f, 1f)
+            visualConfidence*.26f +
+            colorConfidence*.23f +
+            optionConfidence*.19f +
+            setConfidence*.12f +
+            structureConfidence*.20f
+        ).coerceIn(0f,1f)
 
+        val st = best.candidate.structure
         return Result(
             screw = best.candidate.screw,
             targetIndex = best.candidate.targetIndex,
@@ -90,11 +104,18 @@ object BoardPlanner {
             runnerUpScore = second,
             confidence = confidence,
             margin = margin,
-            depth = 3
+            depth = 3,
+            pieceId = st.pieceId,
+            pieceScrewCount = st.pieceScrewCount,
+            releasePotential = st.releasePotential,
+            revealPotential = st.revealPotential
         )
     }
 
-    private fun buildCandidates(d: PuzzleDetector.Detection): List<Candidate> {
+    private fun buildCandidates(
+        d: PuzzleDetector.Detection,
+        analysis: PieceAnalyzer.Analysis
+    ): List<Candidate> {
         val out = mutableListOf<Candidate>()
         for (s in d.screws) {
             var bestTarget = -1
@@ -113,39 +134,71 @@ object BoardPlanner {
                 other !== s && hypot((other.x-s.x).toDouble(), (other.y-s.y).toDouble()) < 150.0
             }
             val edge = min(abs(s.x - 360f), abs(s.y - 720f)) / 720f
-            val freedom = (1f - edge).coerceIn(0f, 1f)
-            out += Candidate(s, bestTarget, bestCost, density, freedom)
+            val freedom = (1f-edge).coerceIn(0f,1f)
+            val st = analysis.byScrew[s] ?: PieceAnalyzer.ScrewStructure(
+                pieceId=-1,
+                pieceScrewCount=3,
+                exposure=.5f,
+                overlapRisk=.5f,
+                releasePotential=.45f,
+                revealPotential=.45f
+            )
+            out += Candidate(s,bestTarget,bestCost,density,freedom,st)
         }
         return out
     }
 
     private fun immediateScore(c: Candidate, counts: IntArray): Float {
-        val count = counts.getOrElse(c.targetIndex) { 0 }
+        val count = counts.getOrElse(c.targetIndex){0}
         val setScore = when {
             count >= 3 -> 110f
             count == 2 -> 52f
             else -> 5f
         }
-        return setScore + c.screw.score * 70f + (60f-c.colorCost) + c.localDensity*4.5f + c.edgeFreedom*8f
+
+        val structural =
+            c.structure.releasePotential*42f +
+            c.structure.revealPotential*48f +
+            c.structure.exposure*18f -
+            c.structure.overlapRisk*7f
+
+        // Extra reward for a piece that is down to one visible screw; these moves
+        // are most likely to remove/drop an entire piece and uncover more board.
+        val freePieceBonus = when(c.structure.pieceScrewCount) {
+            1 -> 36f
+            2 -> 18f
+            else -> 0f
+        }
+
+        return setScore + c.screw.score*70f + (60f-c.colorCost) +
+            c.localDensity*4.0f + c.edgeFreedom*7f + structural + freePieceBonus
     }
 
-    private fun sequenceScore(a: Candidate, b: Candidate, c: Candidate): Float {
-        var score = 0f
-        if (a.targetIndex == b.targetIndex && b.targetIndex == c.targetIndex) score += 95f
-        else if (a.targetIndex == b.targetIndex || b.targetIndex == c.targetIndex) score += 25f
+    private fun sequenceScore(a:Candidate,b:Candidate,c:Candidate):Float {
+        var score=0f
+        if(a.targetIndex==b.targetIndex && b.targetIndex==c.targetIndex) score+=95f
+        else if(a.targetIndex==b.targetIndex || b.targetIndex==c.targetIndex) score+=25f
+
+        // Prefer sequences that finish/open a structural piece rather than tapping
+        // three unrelated screws that only happen to share a color.
+        if(a.structure.pieceId==b.structure.pieceId) score+=18f
+        if(b.structure.pieceId==c.structure.pieceId) score+=14f
+        score += (a.structure.revealPotential+b.structure.revealPotential+c.structure.revealPotential)*12f
+        score += (a.structure.releasePotential+b.structure.releasePotential+c.structure.releasePotential)*10f
+
         score -= (a.colorCost+b.colorCost+c.colorCost)*.16f
-        score += (a.localDensity+b.localDensity+c.localDensity)*1.6f
+        score += (a.localDensity+b.localDensity+c.localDensity)*1.4f
         return score
     }
 
-    private fun colorDistance(a: PuzzleDetector.Hsv, b: PuzzleDetector.Hsv): Float {
-        val satMin = min(a.s,b.s)
-        val hueWeight = if (satMin < .18f) .10f else 1f
+    private fun colorDistance(a:PuzzleDetector.Hsv,b:PuzzleDetector.Hsv):Float {
+        val satMin=min(a.s,b.s)
+        val hueWeight=if(satMin<.18f).10f else 1f
         return hueDiff(a.h,b.h)*hueWeight + abs(a.s-b.s)*52f + abs(a.v-b.v)*14f
     }
 
-    private fun hueDiff(a: Float,b: Float): Float {
-        val d = abs(a-b)%360f
+    private fun hueDiff(a:Float,b:Float):Float {
+        val d=abs(a-b)%360f
         return min(d,360f-d)
     }
 }
