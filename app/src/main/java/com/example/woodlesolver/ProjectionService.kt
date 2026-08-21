@@ -12,292 +12,232 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
 import androidx.core.app.NotificationCompat
+import kotlin.math.abs
 
+/**
+ * V14 ground-up solver.
+ *
+ * This intentionally bypasses the old PuzzleDetector / VisionReliability / planner
+ * state machine. The old system could sit in WAIT forever if either target sampling
+ * or screw detection failed. V14 reads the actual Woodle collector frames and screw
+ * heads directly and makes one verified move at a time.
+ */
 class ProjectionService : Service() {
-
     companion object {
-        const val ACTION_START = "woodle.START"
-        const val ACTION_STOP = "woodle.STOP"
-        const val EXTRA_RESULT_CODE = "resultCode"
-        const val EXTRA_RESULT_DATA = "resultData"
-
-        private const val CHANNEL_ID = "solver"
-        private const val NOTIFICATION_ID = 71
+        const val ACTION_START="woodle.START"
+        const val ACTION_STOP="woodle.STOP"
+        const val EXTRA_RESULT_CODE="resultCode"
+        const val EXTRA_RESULT_DATA="resultData"
+        private const val CHANNEL_ID="solver"
+        private const val NOTIFICATION_ID=71
+        private const val VERIFY_START_MS=150L
+        private const val VERIFY_TIMEOUT_MS=900L
+        private const val MIN_MOVE_GAP_MS=115L
     }
 
-    private var projection: MediaProjection? = null
-    private var display: VirtualDisplay? = null
-    private var reader: ImageReader? = null
+    private var projection:MediaProjection?=null
+    private var display:VirtualDisplay?=null
+    private var reader:ImageReader?=null
+    private val thread=HandlerThread("WoodleV14Capture")
+    private lateinit var handler:Handler
+    @Volatile private var running=false
 
-    private val handlerThread = HandlerThread("WoodleSolverCapture")
-    private lateinit var handler: Handler
+    private var lastTapAt=0L
+    private var lastTapX=-9999
+    private var lastTapY=-9999
+    private var levelX=-9999
+    private var levelY=-9999
+    private var levelStable=0
 
-    @Volatile
-    private var running = false
+    private var awaitingResult=false
+    private var expectedX=-9999
+    private var expectedY=-9999
+    private var expectedColor=GameplayVision.Color.UNKNOWN
+    private var tapBeforeScrews=0
 
-    private var lastTapX = -9999
-    private var lastTapY = -9999
-    private var lastTapAt = 0L
+    // Two-frame candidate persistence: prevents one noisy frame from causing a tap.
+    private var candidateX=-9999
+    private var candidateY=-9999
+    private var candidateColor=GameplayVision.Color.UNKNOWN
+    private var candidateFrames=0
 
-    private var stableFrames = 0
-    private var lastCandidateX = -1
-    private var lastCandidateY = -1
-
-    private var levelButtonStableFrames = 0
-    private var lastLevelButtonX = -1
-    private var lastLevelButtonY = -1
-
-    override fun onCreate() {
-        super.onCreate()
-        handlerThread.start()
-        handler = Handler(handlerThread.looper)
-        createNotificationChannel()
+    override fun onCreate(){
+        super.onCreate();thread.start();handler=Handler(thread.looper);createNotificationChannel()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> stopSolver()
-            ACTION_START -> {
-                val code = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
-                val data = if (Build.VERSION.SDK_INT >= 33) {
-                    intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    intent.getParcelableExtra(EXTRA_RESULT_DATA)
-                }
-
-                if (code == Activity.RESULT_OK && data != null) {
-                    startForeground(NOTIFICATION_ID, buildNotification("Waiting for Woodle Screw…"))
-                    startCapture(code, data)
-                } else {
-                    stopSelf()
-                }
+    override fun onStartCommand(intent:Intent?,flags:Int,startId:Int):Int{
+        when(intent?.action){
+            ACTION_STOP->stopSolver()
+            ACTION_START->{
+                val code=intent.getIntExtra(EXTRA_RESULT_CODE,Activity.RESULT_CANCELED)
+                val data=if(Build.VERSION.SDK_INT>=33) intent.getParcelableExtra(EXTRA_RESULT_DATA,Intent::class.java)
+                else {@Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_RESULT_DATA)}
+                if(code==Activity.RESULT_OK&&data!=null){
+                    startForeground(NOTIFICATION_ID,notification("V14: waiting for Woodle Screw"))
+                    startCapture(code,data)
+                } else stopSelf()
             }
         }
         return START_NOT_STICKY
     }
 
-    private fun startCapture(resultCode: Int, resultData: Intent) {
-        if (running) return
-        running = true
-
-        val dm = resources.displayMetrics
-        val width = dm.widthPixels
-        val height = dm.heightPixels
-        val density = dm.densityDpi
-
-        reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-
-        val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        projection = mgr.getMediaProjection(resultCode, resultData)
-
-        projection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
-                handler.post { stopSolver() }
-            }
-        }, handler)
-
-        display = projection?.createVirtualDisplay(
-            "WoodleCapture",
-            width,
-            height,
-            density,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            reader?.surface,
-            null,
-            handler
-        )
-
-        reader?.setOnImageAvailableListener({ r ->
-            val image = r.acquireLatestImage() ?: return@setOnImageAvailableListener
-            try {
-                if (!running) return@setOnImageAvailableListener
-
-                val plane = image.planes[0]
-                val buffer = plane.buffer
-                val pixelStride = plane.pixelStride
-                val rowStride = plane.rowStride
-                val rowPadding = rowStride - pixelStride * image.width
-
-                val padded = Bitmap.createBitmap(
-                    image.width + rowPadding / pixelStride,
-                    image.height,
-                    Bitmap.Config.ARGB_8888
-                )
-                padded.copyPixelsFromBuffer(buffer)
-
-                val frame = Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
+    private fun startCapture(code:Int,data:Intent){
+        if(running)return
+        running=true
+        val dm=resources.displayMetrics
+        val w=dm.widthPixels;val h=dm.heightPixels
+        reader=ImageReader.newInstance(w,h,PixelFormat.RGBA_8888,2)
+        val mgr=getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        projection=mgr.getMediaProjection(code,data)
+        projection?.registerCallback(object:MediaProjection.Callback(){override fun onStop(){handler.post{stopSolver()}}},handler)
+        display=projection?.createVirtualDisplay("WoodleV14",w,h,dm.densityDpi,DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,reader?.surface,null,handler)
+        reader?.setOnImageAvailableListener({r->
+            val image=r.acquireLatestImage()?:return@setOnImageAvailableListener
+            try{
+                if(!running)return@setOnImageAvailableListener
+                val p=image.planes[0]
+                val pad=p.rowStride-p.pixelStride*image.width
+                val padded=Bitmap.createBitmap(image.width+pad/p.pixelStride,image.height,Bitmap.Config.ARGB_8888)
+                padded.copyPixelsFromBuffer(p.buffer)
+                val frame=Bitmap.createBitmap(padded,0,0,image.width,image.height)
                 padded.recycle()
-
                 analyze(frame)
                 frame.recycle()
-            } finally {
-                image.close()
-            }
-        }, handler)
+            }finally{image.close()}
+        },handler)
     }
 
-    private fun analyze(frame: Bitmap) {
-        val now = SystemClock.elapsedRealtime()
-
-        // Absolute safety gate: if an ad/browser/other game becomes foreground,
-        // do nothing until Woodle Screw is foreground again.
-        if (!AutoTapAccessibilityService.isWoodleForeground()) {
-            resetStableState()
-            updateNotification("Paused — Woodle Screw is not foreground")
+    private fun analyze(frame:Bitmap){
+        val now=SystemClock.elapsedRealtime()
+        if(!AutoTapAccessibilityService.isWoodleForeground()){
+            resetCandidate();levelStable=0;awaitingResult=false
+            update("V14 paused: Woodle not foreground")
             return
         }
 
-        val detection = PuzzleDetector.detect(frame)
-
-        when (detection.state) {
-            PuzzleDetector.ScreenState.WAIT -> {
-                // This includes loading, PERFECT/reward animation, and ads.
-                // We intentionally DO NOT tap any Claim/Install/Yummy Town/ad UI.
-                resetStableState()
-                updateNotification("Waiting for level/reward/ad to finish")
-            }
-
-            PuzzleDetector.ScreenState.LEVEL_BUTTON -> {
-                stableFrames = 0
-                val x = detection.levelButtonX ?: return
-                val y = detection.levelButtonY ?: return
-
-                val sameButton =
-                    kotlin.math.abs(x - lastLevelButtonX) < 30 &&
-                    kotlin.math.abs(y - lastLevelButtonY) < 30
-
-                if (sameButton) {
-                    levelButtonStableFrames++
-                } else {
-                    levelButtonStableFrames = 1
-                    lastLevelButtonX = x
-                    lastLevelButtonY = y
-                }
-
-                updateNotification("Level button found (${levelButtonStableFrames}/3)")
-
-                // Require several consecutive frames so a green ad graphic cannot
-                // trigger a one-frame false positive.
-                if (levelButtonStableFrames < 3) return
-                if (now - lastTapAt < 1800) return
-
-                if (AutoTapAccessibilityService.tap(x.toFloat(), y.toFloat())) {
-                    lastTapX = x
-                    lastTapY = y
-                    lastTapAt = now
-                    levelButtonStableFrames = 0
-                    updateNotification("Starting next level")
-                }
-            }
-
-            PuzzleDetector.ScreenState.PUZZLE -> {
-                levelButtonStableFrames = 0
-
-                // Let the board settle after each tap / level transition.
-                if (now - lastTapAt < 700) return
-
-                val candidate = PuzzleDetector.chooseTap(detection)
-                updateNotification(
-                    "Puzzle: targets=${detection.targets.size}, screws=${detection.screws.size}"
-                )
-
-                if (candidate == null) {
-                    stableFrames = 0
-                    return
-                }
-
-                // Extra hard safety zone copied from the actual gameplay layout:
-                // never touch collector boxes, tools, bottom banners, or navigation.
-                val minY = (frame.height * .22f).toInt()
-                val maxY = (frame.height * .82f).toInt()
-                val minX = (frame.width * .02f).toInt()
-                val maxX = (frame.width * .98f).toInt()
-                if (candidate.x !in minX..maxX || candidate.y !in minY..maxY) {
-                    stableFrames = 0
-                    return
-                }
-
-                val closeToLastCandidate =
-                    kotlin.math.abs(candidate.x - lastCandidateX) < 22 &&
-                    kotlin.math.abs(candidate.y - lastCandidateY) < 22
-
-                if (closeToLastCandidate) {
-                    stableFrames++
-                } else {
-                    stableFrames = 1
-                    lastCandidateX = candidate.x
-                    lastCandidateY = candidate.y
-                }
-
-                if (stableFrames < 2) return
-
-                val sameAsLastTap =
-                    kotlin.math.abs(candidate.x - lastTapX) < 24 &&
-                    kotlin.math.abs(candidate.y - lastTapY) < 24
-                if (sameAsLastTap && now - lastTapAt < 2400) return
-
-                if (AutoTapAccessibilityService.tap(candidate.x.toFloat(), candidate.y.toFloat())) {
-                    lastTapX = candidate.x
-                    lastTapY = candidate.y
-                    lastTapAt = now
-                    stableFrames = 0
-                    updateNotification("Tapped screw (${candidate.x}, ${candidate.y})")
-                }
+        val d=GameplayVision.analyze(frame)
+        when(d.screen){
+            GameplayVision.Screen.HOME -> handleHome(d,now)
+            GameplayVision.Screen.PUZZLE -> handlePuzzle(d,now)
+            GameplayVision.Screen.WAIT -> {
+                resetCandidate();levelStable=0
+                update("V14: waiting through loading / reward / ad")
             }
         }
     }
 
-    private fun resetStableState() {
-        stableFrames = 0
-        levelButtonStableFrames = 0
-        lastCandidateX = -1
-        lastCandidateY = -1
-        lastLevelButtonX = -1
-        lastLevelButtonY = -1
-    }
+    private fun handleHome(d:GameplayVision.Detection,now:Long){
+        awaitingResult=false;resetCandidate()
+        val x=d.levelX?:return;val y=d.levelY?:return
+        val same=abs(x-levelX)<35&&abs(y-levelY)<35
+        if(same)levelStable++ else {levelX=x;levelY=y;levelStable=1}
+        update("V14: LEVEL found at $x,$y (${levelStable}/2)")
+        if(levelStable<2||now-lastTapAt<500L)return
 
-    private fun stopSolver() {
-        running = false
-        reader?.setOnImageAvailableListener(null, null)
-        display?.release()
-        display = null
-        reader?.close()
-        reader = null
-        projection?.stop()
-        projection = null
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Woodle Solver", NotificationManager.IMPORTANCE_LOW)
-            )
+        // IMPORTANT: MediaProjection and Accessibility both use display coordinates
+        // here, so use the raw coordinate. Do not remap through root-window bounds.
+        if(AutoTapAccessibilityService.tap(x.toFloat(),y.toFloat())){
+            lastTapAt=now;lastTapX=x;lastTapY=y;levelStable=0
+            update("V14: tapped LEVEL — waiting for puzzle")
         }
     }
 
-    private fun buildNotification(text: String): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_menu_view)
-            .setContentTitle("Woodle Solver running")
-            .setContentText(text)
-            .setOngoing(true)
-            .build()
+    private fun handlePuzzle(d:GameplayVision.Detection,now:Long){
+        levelStable=0
+        val active=d.trays.filter{it.active&&it.color!=GameplayVision.Color.UNKNOWN}
+        val trayText=active.joinToString("/"){"${it.color.name.lowercase()}:${it.filled}"}.ifBlank{"none"}
+
+        if(awaitingResult){
+            val elapsed=now-lastTapAt
+            if(elapsed<VERIFY_START_MS){update("V14 verifying ${expectedColor.name.lowercase()}…");return}
+            val stillThere=d.screws.any{abs(it.x-expectedX)<34&&abs(it.y-expectedY)<34&&it.color==expectedColor}
+            val screwCountDropped=d.screws.size<tapBeforeScrews
+            if(!stillThere||screwCountDropped){
+                awaitingResult=false;resetCandidate()
+                update("V14: move confirmed | trays $trayText | ${d.screws.size} screws")
+                return
+            }
+            if(elapsed<VERIFY_TIMEOUT_MS){update("V14: waiting for screw to clear…");return}
+            awaitingResult=false;resetCandidate()
+            update("V14: tap had no effect — rescanning")
+            return
+        }
+
+        if(now-lastTapAt<MIN_MOVE_GAP_MS)return
+        if(active.isEmpty()){
+            resetCandidate();update("V14: puzzle seen, but collector color not readable yet")
+            return
+        }
+        if(d.screws.isEmpty()){
+            resetCandidate();update("V14: puzzle seen | trays $trayText | scanning screws…")
+            return
+        }
+
+        val choice=chooseMove(d,active)
+        if(choice==null){
+            resetCandidate()
+            val colors=d.screws.groupingBy{it.color}.eachCount().entries.joinToString(" "){"${it.key.name.lowercase()}:${it.value}"}
+            update("V14: no visible screw for tray $trayText | saw $colors")
+            return
+        }
+
+        val same=choice.color==candidateColor&&abs(choice.x-candidateX)<26&&abs(choice.y-candidateY)<26
+        if(same)candidateFrames++ else {
+            candidateX=choice.x;candidateY=choice.y;candidateColor=choice.color;candidateFrames=1
+        }
+        if(candidateFrames<2){
+            update("V14: confirming ${choice.color.name.lowercase()} screw at ${choice.x},${choice.y}")
+            return
+        }
+
+        if(abs(choice.x-lastTapX)<25&&abs(choice.y-lastTapY)<25&&now-lastTapAt<1200L){
+            resetCandidate();return
+        }
+
+        update("V14: tapping ${choice.color.name.lowercase()} | trays $trayText | score ${(choice.score*100).toInt()}")
+        if(AutoTapAccessibilityService.tap(choice.x.toFloat(),choice.y.toFloat())){
+            lastTapAt=now;lastTapX=choice.x;lastTapY=choice.y
+            expectedX=choice.x;expectedY=choice.y;expectedColor=choice.color
+            tapBeforeScrews=d.screws.size;awaitingResult=true;resetCandidate()
+        }
     }
 
-    private fun updateNotification(text: String) {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIFICATION_ID, buildNotification(text))
+    /**
+     * Woodle wants screws matching the active collector colors.
+     * Priority:
+     *  1. Continue a tray that already has collected screws.
+     *  2. Prefer a color with >=3 visible screws.
+     *  3. Prefer a confident exposed screw near the top of the pile; after every
+     *     move the board is rescanned so falling/rotating pieces are handled closed-loop.
+     */
+    private fun chooseMove(d:GameplayVision.Detection,active:List<GameplayVision.Tray>):GameplayVision.Screw?{
+        var best:GameplayVision.Screw?=null
+        var bestScore=Float.NEGATIVE_INFINITY
+        val visibleCounts=d.screws.groupingBy{it.color}.eachCount()
+        for(s in d.screws){
+            val tray=active.firstOrNull{it.color==s.color}?:continue
+            val count=visibleCounts[s.color]?:0
+            var score=s.score*120f
+            score+=tray.filled*48f
+            score+=when{count>=3->85f;count==2->32f;else->0f}
+            // Slight preference for higher screws because they are more often on top
+            // and less likely to be hidden under another plank.
+            score+=(1f-s.y/1700f).coerceIn(0f,1f)*12f
+            if(score>bestScore){bestScore=score;best=s}
+        }
+        return best
     }
 
-    override fun onBind(intent: Intent?) = null
+    private fun resetCandidate(){candidateX=-9999;candidateY=-9999;candidateColor=GameplayVision.Color.UNKNOWN;candidateFrames=0}
 
-    override fun onDestroy() {
-        running = false
-        handlerThread.quitSafely()
-        super.onDestroy()
+    private fun stopSolver(){
+        running=false;reader?.setOnImageAvailableListener(null,null);display?.release();display=null
+        reader?.close();reader=null;projection?.stop();projection=null
+        stopForeground(STOP_FOREGROUND_REMOVE);stopSelf()
     }
+    private fun createNotificationChannel(){if(Build.VERSION.SDK_INT>=26)getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(CHANNEL_ID,"Woodle Solver",NotificationManager.IMPORTANCE_LOW))}
+    private fun notification(t:String):Notification=NotificationCompat.Builder(this,CHANNEL_ID).setSmallIcon(android.R.drawable.ic_menu_view).setContentTitle("Woodle Solver V14 Ground-Up").setContentText(t).setOngoing(true).build()
+    private fun update(t:String){getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,notification(t))}
+    override fun onBind(intent:Intent?)=null
+    override fun onDestroy(){running=false;thread.quitSafely();super.onDestroy()}
 }
